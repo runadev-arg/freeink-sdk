@@ -20,7 +20,10 @@ bool SecureClient::tls13Available() {
 SecureClient::~SecureClient() { stop(); }
 
 void SecureClient::setCACert(const char* rootCA) { _rootCA = rootCA; }
-void SecureClient::setInsecure() { _insecure = true; }
+void SecureClient::setInsecure() {
+  _insecure = true;
+  _strict = false;
+}
 
 #if defined(FREEINK_NET_WOLFSSL)
 
@@ -69,11 +72,15 @@ int SecureClient::connectWithMethod(const char* host, uint16_t port, void* metho
   stop();
   const uint32_t timeoutMs = getTimeout();
   if (abortRequested()) return 0;
-  _transport.setConnectionTimeout(timeoutMs);
-  if (!_transport.connect(host, port)) {
+  _transport.setConnectionTimeout(_connectTimeoutMs ? _connectTimeoutMs : timeoutMs);
+  // The two-argument form on purpose: the one taking a timeout overwrites the
+  // socket's read and write timeouts as well.
+  if (!(_pinned ? _transport.connect(_pinnedIp, port) : _transport.connect(host, port))) {
     if (Serial) Serial.printf("[SecureClient] TCP connect failed (%s): %s:%u\n", label, host, port);
+    fail(FailStage::Tcp, 0);
     return 0;
   }
+  _transport.setConnectionTimeout(timeoutMs);
   if (abortRequested()) {
     _transport.stop();
     return 0;
@@ -82,12 +89,25 @@ int SecureClient::connectWithMethod(const char* host, uint16_t port, void* metho
   auto* ctx = wolfSSL_CTX_new(static_cast<WOLFSSL_METHOD*>(method));
   if (!ctx) {
     if (Serial) Serial.printf("[SecureClient] CTX alloc failed (%s), free heap %u\n", label, (unsigned)ESP.getFreeHeap());
+    fail(FailStage::Alloc, static_cast<int>(ESP.getFreeHeap()));
     _transport.stop();
     return 0;
   }
   _ctx = ctx;
 
-  if (_insecure) {
+  if (_strict) {
+    wolfSSL_CTX_set_verify(ctx, WOLFSSL_VERIFY_PEER | WOLFSSL_VERIFY_FAIL_IF_NO_PEER_CERT, nullptr);
+    for (size_t i = 0; i < _anchorCount; ++i) {
+      const int loaded = wolfSSL_CTX_load_verify_buffer(ctx, reinterpret_cast<const unsigned char*>(_anchors[i]),
+                                                        strlen(_anchors[i]), WOLFSSL_FILETYPE_PEM);
+      if (loaded != WOLFSSL_SUCCESS) {
+        if (Serial) Serial.printf("[SecureClient] trust anchor %u failed to load: %d\n", (unsigned)i, loaded);
+        fail(FailStage::TrustLoad, loaded);
+        stop();
+        return 0;
+      }
+    }
+  } else if (_insecure) {
     wolfSSL_CTX_set_verify(ctx, WOLFSSL_VERIFY_NONE, nullptr);
   } else if (_rootCA) {
     wolfSSL_CTX_load_verify_buffer(ctx, reinterpret_cast<const unsigned char*>(_rootCA),
@@ -99,6 +119,7 @@ int SecureClient::connectWithMethod(const char* host, uint16_t port, void* metho
   auto* ssl = wolfSSL_new(ctx);
   if (!ssl) {
     if (Serial) Serial.printf("[SecureClient] SSL alloc failed (%s), free heap %u\n", label, (unsigned)ESP.getFreeHeap());
+    fail(FailStage::Alloc, static_cast<int>(ESP.getFreeHeap()));
     stop();
     return 0;
   }
@@ -106,6 +127,14 @@ int SecureClient::connectWithMethod(const char* host, uint16_t port, void* metho
   wolfSSL_SetIOReadCtx(ssl, &_transport);
   wolfSSL_SetIOWriteCtx(ssl, &_transport);
   wolfSSL_UseSNI(ssl, WOLFSSL_SNI_HOST_NAME, host, strlen(host));
+  if (_strict) {
+    const int named = wolfSSL_check_domain_name(ssl, host);
+    if (named != WOLFSSL_SUCCESS) {
+      fail(FailStage::TrustLoad, named);
+      stop();
+      return 0;
+    }
+  }
 #if defined(WOLFSSL_TLS13) && defined(HAVE_CURVE25519)
   // MEMFIX-PORT: pin the TLS 1.3 key_share to X25519. wolfSSL's default is a
   // P-256 share, generated with fast-math bignums that WOLFSSL_SMALL_STACK
@@ -135,6 +164,7 @@ int SecureClient::connectWithMethod(const char* host, uint16_t port, void* metho
     const int err = wolfSSL_get_error(ssl, ret);
     if (!isWantIo(err)) {
       if (Serial) Serial.printf("[SecureClient] wolfSSL_connect failed (%s): %d\n", label, err);
+      fail(FailStage::Handshake, err);
       stop();
       return 0;
     }
@@ -148,6 +178,7 @@ int SecureClient::connectWithMethod(const char* host, uint16_t port, void* metho
         Serial.printf("[SecureClient] handshake timeout (%s): last err %d, transport %s, free heap %u\n", label, err,
                       _transport.connected() ? "up" : "down", (unsigned)ESP.getFreeHeap());
       }
+      fail(FailStage::Timeout, err);
       stop();
       return 0;
     }
@@ -164,17 +195,19 @@ int SecureClient::connectWithMethod(const char* host, uint16_t port, void* metho
 bool SecureClient::abortRequested() {
   if (!_shouldAbort || !_shouldAbort()) return false;
   _aborted = true;
+  fail(FailStage::Aborted, 0);
   return true;
 }
 
 int SecureClient::connect(const char* host, uint16_t port) {
   _aborted = false;
+  fail(FailStage::None, 0);
   // Negotiate the highest mutually supported version rather than pinning TLS 1.3:
   // self-hosted / Let's Encrypt nginx often tops out at TLS 1.2, and a 1.3-only
   // client fails those handshakes outright. v23 still selects 1.3 when the peer
   // offers it (WOLFSSL_TLS13 is enabled) and falls back to 1.2 otherwise.
   if (connectWithMethod(host, port, wolfSSLv23_client_method(), "auto")) return 1;
-  if (_aborted) return 0;
+  if (_aborted || _strict) return 0;
 
   // Some TLS 1.2-only servers are intolerant of a TLS 1.3-capable ClientHello
   // and abort with a fatal handshake_failure alert. Retry with an explicit

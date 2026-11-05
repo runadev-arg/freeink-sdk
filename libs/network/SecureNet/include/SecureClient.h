@@ -39,6 +39,41 @@ class SecureClient : public Client {
   void setCACert(const char* rootCA);
   void setInsecure();  // skip peer verification (testing only)
 
+  // Opt-in strict mode, for callers that must not talk to an impostor. Peer
+  // verification is mandatory, every anchor is loaded on its own and checked
+  // (one PEM blob would hide a bad certificate: wolfSSL skips it and reports
+  // success if any other parsed), the certificate name must match the host given
+  // to connect(), and there is no TLS 1.2 retry, whose error would hide the real
+  // one. A count of 0 trusts nothing, so it fails closed. The array and the
+  // strings must outlive the client. Overrides setCACert() and setInsecure();
+  // calling setInsecure() afterwards returns to the insecure path.
+  void setTrustAnchors(const char* const* pemAnchors, size_t count) {
+    _anchors = pemAnchors;
+    _anchorCount = count;
+    _strict = true;
+    _insecure = false;
+  }
+
+  // Dial this address instead of resolving the host. SNI and the certificate
+  // name keep using the host given to connect(). This also avoids
+  // Network.hostByName(), whose dns_clear_cache() runs without the TCPIP lock.
+  void setServerAddress(IPAddress ip) {
+    _pinnedIp = ip;
+    _pinned = true;
+  }
+  void clearServerAddress() { _pinned = false; }
+
+  // TCP connect window; 0 (the default) uses the stream timeout, as before.
+  void setConnectTimeout(uint32_t ms) { _connectTimeoutMs = ms; }
+
+  // Why the last connect() returned 0. The code is wolfSSL's for Handshake and
+  // TrustLoad, and the free heap for Alloc.
+  enum class FailStage : uint8_t { None, Tcp, Alloc, TrustLoad, Handshake, Timeout, Aborted };
+  FailStage lastFailStage() const { return _failStage; }
+  int lastFailCode() const { return _failCode; }
+  // The live WOLFSSL*, for diagnostics only. Null when not connected.
+  void* nativeHandle() const { return _ssl; }
+
   // Polled during connect(): between the TCP connect and the handshake, on
   // every handshake round-trip, and between the two handshake attempts. A
   // caller that drives its own input loop can use this both to cancel and to
@@ -77,12 +112,24 @@ class SecureClient : public Client {
   // Polls _shouldAbort and latches _aborted so callers can tell a cancel from
   // a failure after connect() returns 0.
   bool abortRequested();
+  void fail(FailStage stage, int code) {
+    _failStage = stage;
+    _failCode = code;
+  }
 
   WiFiClient _transport;
   AbortCallback _shouldAbort;
   bool _aborted = false;
   const char* _rootCA = nullptr;
   bool _insecure = false;
+  const char* const* _anchors = nullptr;
+  size_t _anchorCount = 0;
+  bool _strict = false;
+  bool _pinned = false;
+  IPAddress _pinnedIp;
+  uint32_t _connectTimeoutMs = 0;
+  FailStage _failStage = FailStage::None;
+  int _failCode = 0;
   void* _ssl = nullptr;  // WOLFSSL* (opaque to keep wolfSSL headers out of here)
   void* _ctx = nullptr;  // WOLFSSL_CTX*
   bool _connected = false;

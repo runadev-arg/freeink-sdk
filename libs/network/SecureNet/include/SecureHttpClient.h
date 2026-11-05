@@ -65,12 +65,31 @@ class SecureHttpClient {
 
   // Skip peer verification (SecureClient does likewise). Required today because
   // the wolfSSL transport has no CA bundle wired up; see setCACert().
-  void setInsecure() { _insecure = true; }
+  void setInsecure() {
+    _insecure = true;
+    _strict = false;
+  }
   // Verify against a single PEM root. Clears the insecure flag.
   void setCACert(const char* rootCA) {
     _rootCA = rootCA;
     _insecure = false;
   }
+  // Strict verification against several anchors; see SecureClient::setTrustAnchors.
+  void setTrustAnchors(const char* const* pemAnchors, size_t count) {
+    _anchors = pemAnchors;
+    _anchorCount = count;
+    _strict = true;
+    _insecure = false;
+  }
+  // Dial this address for the next connection; see SecureClient::setServerAddress.
+  // The Host header, SNI and certificate name stay on the URL's host. A kept-alive
+  // connection to the same host is reused whatever the pin says.
+  void setServerAddress(IPAddress ip) {
+    _pinnedIp = ip;
+    _pinned = true;
+  }
+  void clearServerAddress() { _pinned = false; }
+  void setConnectTimeout(uint32_t ms) { _connectTimeoutMs = ms; }
   void setTimeout(uint32_t ms) { _timeoutMs = ms; }
   // Progress reporting for response bodies (download meters). Called after
   // each delivered chunk with the running byte count; never called for
@@ -211,14 +230,17 @@ class SecureHttpClient {
     for (int attempt = 0; attempt < 2; ++attempt) {
       const bool reusing = connectionMatches();
       if (isAborted(shouldAbort)) return -1;
+      _stage = Stage::Connect;
       if (!ensureConnected(shouldAbort)) return -1;
 
+      _stage = Stage::Send;
       if (!writeRequest(method, payload, payloadLen)) {
         closeConnection();
         if (reusing && attempt == 0) continue;
         return -1;
       }
 
+      _stage = Stage::Headers;
       const unsigned long headerDeadline = millis() + _timeoutMs;
       std::string line;
       if (!readLine(*_conn, line, headerDeadline, shouldAbort)) {
@@ -273,6 +295,7 @@ class SecureHttpClient {
       _downloaded = 0;
       _reportProgress = !discardBody && static_cast<bool>(_progress);
 
+      _stage = Stage::Body;
       bool reusableFraming = true;
       if (transferEncoding.find("chunked") != std::string::npos) {
         _bodyComplete = readChunked(*_conn, bodySink, shouldAbort);
@@ -302,6 +325,13 @@ class SecureHttpClient {
   bool responseComplete() const { return _bodyComplete; }
   bool callbackAborted() const { return _callbackAborted; }
   bool aborted() const { return _aborted; }
+  // Where the last request stopped, for callers that report it.
+  enum class Stage : uint8_t { None, Connect, Send, Headers, Body };
+  Stage lastStage() const { return _stage; }
+  const SecureClient& secureClient() const { return _secure; }
+  // True when begin()'s target is already served by a live connection, so the
+  // next request costs no DNS, TCP or handshake.
+  bool hasLiveConnection() const { return connectionMatches(); }
   bool hasContentLength() const { return _haveContentLength; }
   size_t getContentLength() const { return _contentLength; }
 
@@ -414,7 +444,15 @@ class SecureHttpClient {
     if (connectionMatches()) return true;
     closeConnection();
     if (_scheme == "https") {
-      if (_insecure) {
+      if (_pinned) {
+        _secure.setServerAddress(_pinnedIp);
+      } else {
+        _secure.clearServerAddress();
+      }
+      _secure.setConnectTimeout(_connectTimeoutMs);
+      if (_strict) {
+        _secure.setTrustAnchors(_anchors, _anchorCount);
+      } else if (_insecure) {
         _secure.setInsecure();
       } else if (_rootCA) {
         _secure.setCACert(_rootCA);
@@ -430,7 +468,7 @@ class SecureHttpClient {
     } else {
       _plain.setTimeout(_timeoutMs);
       _plain.setConnectionTimeout(_timeoutMs);
-      if (!_plain.connect(_host.c_str(), _port)) return false;
+      if (!(_pinned ? _plain.connect(_pinnedIp, _port) : _plain.connect(_host.c_str(), _port))) return false;
       _conn = &_plain;
       _connHttps = false;
     }
@@ -602,6 +640,13 @@ class SecureHttpClient {
   std::string _authUser;
   std::string _authPass;
   bool _insecure = false;
+  const char* const* _anchors = nullptr;
+  size_t _anchorCount = 0;
+  bool _strict = false;
+  bool _pinned = false;
+  IPAddress _pinnedIp;
+  uint32_t _connectTimeoutMs = 0;
+  Stage _stage = Stage::None;
   int _followRedirects = 0;
   bool _allowRedirectDowngrade = false;
   ProgressCallback _progress;

@@ -255,6 +255,7 @@ class SecureHttpClient {
       bool keepAlive = line.compare(0, 9, "HTTP/1.0 ") != 0;
 
       std::string transferEncoding;
+      size_t storedHeaderBytes = 0;
       while (readLine(*_conn, line, headerDeadline, shouldAbort)) {
         if (line.empty()) break;  // end of headers
         const size_t colon = line.find(':');
@@ -264,7 +265,12 @@ class SecureHttpClient {
         while (!value.empty() && value.front() == ' ') value.erase(value.begin());
         std::transform(name.begin(), name.end(), name.begin(),
                        [](unsigned char c) { return static_cast<char>(tolower(c)); });
-        _responseHeaders.push_back(Header{name, value});
+        // Lines are capped, their count is not, and a failed allocation aborts on this target.
+        // Framing below still sees every header; only what is kept is bounded.
+        if (storedHeaderBytes + name.size() + value.size() <= MAX_STORED_HEADER_BYTES) {
+          storedHeaderBytes += name.size() + value.size();
+          _responseHeaders.push_back(Header{name, value});
+        }
         if (name == "content-length") {
           _contentLength = static_cast<size_t>(strtoul(value.c_str(), nullptr, 10));
           _haveContentLength = true;
@@ -616,6 +622,7 @@ class SecureHttpClient {
   // body readers, so kept modest.
   static constexpr size_t READ_CHUNK = 2048;
   static constexpr size_t MAX_LINE = 4096;  // header / chunk-size line cap
+  static constexpr size_t MAX_STORED_HEADER_BYTES = 12288;  // GitHub's OTA redirects run to ~6 KB.
 
   // Kept-alive connection state. _conn points at _secure or _plain while a
   // connection is held open, and null otherwise.
